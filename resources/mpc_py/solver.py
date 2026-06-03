@@ -47,6 +47,7 @@ class StriderNMPC:
 
     from . import params as p
     self.N = int(p.N)
+    self._dt = float(p.DT)
 
     mmap_path = os.environ.get("MRG_MMAP", "/tmp/MRG_debug.mmap")
     self._mmap_writer = MMapWriter(mmap_path, self.N, self.use_full_nx, self.use_full_nu, self.use_full_np)
@@ -76,9 +77,56 @@ class StriderNMPC:
     self._last_r_rotor = np.zeros(8, dtype=np.float64)
     self._last_r_rotor_cmd = np.zeros(8, dtype=np.float64)
 
-  def _set_initial_guess_all_stages(self, solver: AcadosOcpSolver, x0: np.ndarray, u0: np.ndarray, p0: np.ndarray) -> None:
+    # Solver-native warm-start buffers.
+    self._warm_xs_delta = np.zeros((self.N + 1, self.use_delta_nx), dtype=np.float64)
+    self._warm_us_delta = np.zeros((self.N, self.use_delta_nu), dtype=np.float64)
+    self._warm_valid_delta = False
+    self._warm_epoch_delta = -1
+    self._warm_time_delta = np.nan
+
+    self._warm_xs_arm = np.zeros((self.N + 1, self.use_arm_nx), dtype=np.float64)
+    self._warm_us_arm = np.zeros((self.N, self.use_arm_nu), dtype=np.float64)
+    self._warm_valid_arm = False
+    self._warm_epoch_arm = -1
+    self._warm_time_arm = np.nan
+
+    self._warm_xs_full = np.zeros((self.N + 1, self.use_full_nx), dtype=np.float64)
+    self._warm_us_full = np.zeros((self.N, self.use_full_nu), dtype=np.float64)
+    self._warm_valid_full = False
+    self._warm_epoch_full = -1
+    self._warm_time_full = np.nan
+
+  def _interp_rows(self, arr: np.ndarray, s: float) -> np.ndarray:
+    if s <= 0.0: return arr[0, :].copy()
+
+    last = arr.shape[0] - 1
+    if s >= float(last): return arr[last, :].copy()
+
+    i0 = int(np.floor(s))
+    a = float(s - i0)
+    return (1.0 - a) * arr[i0, :] + a * arr[i0 + 1, :]
+
+  def _set_initial_guess(self, solver: AcadosOcpSolver, x0: np.ndarray, u0: np.ndarray, p0: np.ndarray, warm_xs: np.ndarray, warm_us: np.ndarray, warm_valid: bool, warm_epoch: int, warm_time: float, epoch: int, time_sec: float) -> bool:
     solver.set(0, "lbx", x0)
     solver.set(0, "ubx", x0)
+
+    finite_time = np.isfinite(time_sec)
+    same_epoch = warm_valid and (int(epoch) == int(warm_epoch))
+    dt_from_prev = time_sec - warm_time if finite_time and np.isfinite(warm_time) else np.inf
+    time_ok = (0.0 <= dt_from_prev <= self.N * self._dt)
+
+    if same_epoch and time_ok:
+      shift = float(np.clip(dt_from_prev / self._dt, 0.0, float(self.N)))
+
+      for k in range(self.N + 1): # not using warm x guess
+        solver.set(k, "x", x0)
+        solver.set(k, "p", p0)
+
+      for k in range(self.N): # using warm u guess
+        uk = self._interp_rows(warm_us, float(k) + shift)
+        solver.set(k, "u", uk)
+
+      return True
 
     for k in range(self.N + 1):
       solver.set(k, "x", x0)
@@ -87,7 +135,9 @@ class StriderNMPC:
     for k in range(self.N):
       solver.set(k, "u", u0)
 
-  def use_delta_solve(self, x_0, u_0, p, steps_req: int):
+    return False
+
+  def use_delta_solve(self, x_0, u_0, p, steps_req: int, epoch: int = -1, time_sec: float = np.nan):
     x_full = np.asarray(x_0, dtype=np.float64).ravel()
     u_full = np.asarray(u_0, dtype=np.float64).ravel()
     p = np.asarray(p, dtype=np.float64).ravel()
@@ -103,7 +153,8 @@ class StriderNMPC:
     self._x0_delta[:] = x_full[0:6]
 
     # use_delta u = [delta_theta_cmd(0:3)]
-    self._u0_delta[:] = u_full[0:3]
+    if not self._set_initial_guess(self.use_delta_solver, self._x0_delta, self._u0_delta, p, self._warm_xs_delta, self._warm_us_delta, self._warm_valid_delta, self._warm_epoch_delta, self._warm_time_delta, int(epoch), float(time_sec)):
+      self._warm_valid_delta = False
 
     self._set_initial_guess_all_stages(self.use_delta_solver, self._x0_delta, self._u0_delta, p)
 
@@ -112,6 +163,13 @@ class StriderNMPC:
     solve_ms = (time.perf_counter() - t0) * 1000.0
 
     xs, us, ps, x_stage, u_stage = self._extract_all_xup(full_model_using=False, arm_model_using=False, steps_req=steps_req)
+
+    if int(status) == 0:
+      self._warm_xs_delta[:, :] = xs[:, 0:6]
+      self._warm_us_delta[:, :] = us[:, 0:3]
+      self._warm_epoch_delta = int(epoch)
+      self._warm_time_delta = float(time_sec)
+      self._warm_valid_delta = np.isfinite(self._warm_time_delta)
 
     self._mmap_writer.write(x_all=xs, u_all=us, p_all=ps, solve_ms=float(solve_ms), status=int(status))
 
@@ -122,7 +180,7 @@ class StriderNMPC:
       int(status),
     )
 
-  def use_arm_solve(self, x_0, u_0, p, steps_req: int):
+  def use_arm_solve(self, x_0, u_0, p, steps_req: int, epoch: int = -1, time_sec: float = np.nan):
     x_full = np.asarray(x_0, dtype=np.float64).ravel()
     u_full = np.asarray(u_0, dtype=np.float64).ravel()
     p = np.asarray(p, dtype=np.float64).ravel()
@@ -137,13 +195,21 @@ class StriderNMPC:
     # use_arm u = [r_rotor_cmd(0:8)]
     self._u0_arm[:] = u_full[3:11]
 
-    self._set_initial_guess_all_stages(self.use_arm_solver, self._x0_arm, self._u0_arm, p)
+    if not self._set_initial_guess(self.use_arm_solver, self._x0_arm, self._u0_arm, p, self._warm_xs_arm, self._warm_us_arm, self._warm_valid_arm, self._warm_epoch_arm, self._warm_time_arm, int(epoch), float(time_sec)):
+      self._warm_valid_arm = False
 
     t0 = time.perf_counter()
     status = self.use_arm_solver.solve()
     solve_ms = (time.perf_counter() - t0) * 1000.0
 
     xs, us, ps, x_stage, u_stage = self._extract_all_xup(full_model_using=False, arm_model_using=True, steps_req=steps_req)
+
+    if int(status) == 0:
+      self._warm_xs_arm[:, :] = xs[:, :]
+      self._warm_us_arm[:, :] = us[:, 3:11]
+      self._warm_epoch_arm = int(epoch)
+      self._warm_time_arm = float(time_sec)
+      self._warm_valid_arm = np.isfinite(self._warm_time_arm)
 
     self._mmap_writer.write(x_all=xs, u_all=us, p_all=ps, solve_ms=float(solve_ms), status=int(status))
 
@@ -154,18 +220,26 @@ class StriderNMPC:
       int(status),
     )
 
-  def use_full_solve(self, x_0, u_0, p, steps_req: int):
+  def use_full_solve(self, x_0, u_0, p, steps_req: int, epoch: int = -1, time_sec: float = np.nan):
     x_0 = np.asarray(x_0, dtype=np.float64).ravel()
     u_0 = np.asarray(u_0, dtype=np.float64).ravel()
     p = np.asarray(p, dtype=np.float64).ravel()
 
-    self._set_initial_guess_all_stages(self.use_full_solver, x_0, u_0, p)
+    if not self._set_initial_guess(self.use_full_solver, x_0, u_0, p, self._warm_xs_full, self._warm_us_full, self._warm_valid_full, self._warm_epoch_full, self._warm_time_full, int(epoch), float(time_sec)):
+      self._warm_valid_full = False
 
     t0 = time.perf_counter()
     status = self.use_full_solver.solve()
     solve_ms = (time.perf_counter() - t0) * 1000.0
 
     xs, us, ps, x_stage, u_stage = self._extract_all_xup(full_model_using=True, arm_model_using=False, steps_req=steps_req)
+
+    if int(status) == 0:
+      self._warm_xs_full[:, :] = xs
+      self._warm_us_full[:, :] = us
+      self._warm_epoch_full = int(epoch)
+      self._warm_time_full = float(time_sec)
+      self._warm_valid_full = np.isfinite(self._warm_time_full)
 
     self._mmap_writer.write(x_all=xs, u_all=us, p_all=ps, solve_ms=float(solve_ms), status=int(status))
 
@@ -185,6 +259,8 @@ class StriderNMPC:
     arm_using = bool(mpci.get("use_arm", False))
 
     steps_req = int(mpci.get("steps_req", 1))
+    epoch = int(mpci.get("epoch", -1))
+    time_sec = float(mpci.get("time", np.nan))
     if steps_req < 0 or steps_req > self.N:
       raise ValueError(f"steps_req out of range: got {steps_req}, valid=[0, {self.N}]")
 
@@ -196,11 +272,11 @@ class StriderNMPC:
       u_0 = np.zeros(self.use_full_nu, dtype=np.float64)
 
     if delta_using and arm_using:
-      x_stage, u_stage, solve_ms, status = self.use_full_solve(x_0, u_0, p, steps_req)
+      x_stage, u_stage, solve_ms, status = self.use_full_solve(x_0, u_0, p, steps_req, epoch, time_sec)
     elif (not delta_using) and arm_using:
-      x_stage, u_stage, solve_ms, status = self.use_arm_solve(x_0, u_0, p, steps_req)
+      x_stage, u_stage, solve_ms, status = self.use_arm_solve(x_0, u_0, p, steps_req, epoch, time_sec)
     elif delta_using and (not arm_using):
-      x_stage, u_stage, solve_ms, status = self.use_delta_solve(x_0, u_0, p, steps_req)
+      x_stage, u_stage, solve_ms, status = self.use_delta_solve(x_0, u_0, p, steps_req, epoch, time_sec)
     else:
       raise ValueError("At least one of 'use_delta' or 'use_arm' must be enabled.")
 

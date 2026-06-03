@@ -90,6 +90,8 @@ MPCOutput acados_wrapper::compute(const MPCInput& in) {
   mpci["use_delta"] = pybind11::bool_(in.use_delta);
   mpci["use_arm"] = pybind11::bool_(in.use_arm);
   mpci["steps_req"] = pybind11::int_(in.steps_req);
+  mpci["epoch"]     = pybind11::int_(in.epoch);
+  mpci["time"]      = pybind11::float_(std::chrono::duration<double>(in.t.time_since_epoch()).count());
 
   pybind11::object ret = impl_->solver.attr("compute_MPC")(mpci);
   return Impl::from_dict(ret.cast<pybind11::dict>());

@@ -60,7 +60,7 @@ inline constexpr double B2BASE_ALPHA[4] = {M_PI, M_PI, M_PI, M_PI};
 inline constexpr double B2BASE_X[4]     = { 0.12*inv_sqrt2, -0.12*inv_sqrt2, -0.12*inv_sqrt2,  0.12*inv_sqrt2}; // x-distance from the body frame to each base frame [m]
 inline constexpr double B2BASE_Y[4]     = {-0.12*inv_sqrt2, -0.12*inv_sqrt2,  0.12*inv_sqrt2,  0.12*inv_sqrt2}; // y-distance from the body frame to each base frame [m]
 inline constexpr double B2BASE_A[4]     = {0.120, 0.120, 0.120, 0.120};
-inline constexpr double DH_ARM_A[5]     = {0.1395, 0.115, 0.110, 0.024, 0.068};
+inline constexpr double DH_ARM_A[5]     = {0.134, 0.115, 0.110, 0.024, 0.071};
 inline constexpr double DH_ARM_ALPHA[5] = {M_PI/2.0, 0.0, 0.0, M_PI/2.0, 0.0};
 
 // ===== initial arm positions =====
